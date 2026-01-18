@@ -1,0 +1,11 @@
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+pillow==10.3.0
+numpy==1.26.4
+torch # install a wheel compatible with your system (CPU or CUDA)
+diffusers==0.29.2
+transformers==4.43.3
+accelerate==0.33.0
+safetensors==0.4.3
+timm
+opencv-python-headless
