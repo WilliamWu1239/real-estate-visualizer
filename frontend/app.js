@@ -75,6 +75,23 @@ let lastY = 0;
 
 
 
+const promptPreset = document.getElementById('promptPreset');
+
+const PRESETS = {
+  bedroom: "A realistic master bedroom with a queen bed, nightstands, rug, and soft lighting, 4k, interior design",
+  living_room: "A modern living room with a comfortable sofa, coffee table, rug, and natural light, 4k, interior design",
+  kitchen: "A modern kitchen with white shaker cabinets, marble island, stainless steel appliances, and subway tile backsplash, 4k, interior design",
+  bathroom: "A luxury bathroom with a freestanding tub, glass shower, marble vanity, and gold fixtures, 4k, interior design",
+  office: "A productive home office with a large wooden desk, ergonomic chair, bookshelves, and plants, 4k, interior design"
+};
+
+promptPreset.addEventListener('change', () => {
+  const val = promptPreset.value;
+  if (PRESETS[val]) {
+    promptInput.value = PRESETS[val];
+  }
+});
+
 imageInput.addEventListener('change', (e) => {
   const file = e.target.files[0];
   if (!file) return;

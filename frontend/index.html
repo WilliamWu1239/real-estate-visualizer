@@ -55,6 +55,17 @@
 
     <section class="panel">
       <h2>2) Describe your change</h2>
+      <div style="margin-bottom: 8px;">
+        <select id="promptPreset" style="width: 100%; padding: 8px;">
+          <option value="">-- Quick Prompt Presets --</option>
+          <option value="bedroom">Bedroom</option>
+          <option value="living_room">Living Room</option>
+          <option value="kitchen">Kitchen</option>
+          <option value="bathroom">Bathroom</option>
+          <option value="office">Home Office</option>
+        </select>
+      </div>
+
       <textarea id="prompt" rows="6"
         placeholder="e.g., Replace dark cabinets with white shaker cabinets; add a marble island with brass pendant lights; realistic lighting"></textarea>
 
@@ -89,7 +100,7 @@
     <p>For visualization only; consult professionals for feasibility and structural safety.</p>
   </footer>
 
-  <script src="app.js"></script>
+  <script src="app.js?v=1"></script>
 </body>
 
 </html>
