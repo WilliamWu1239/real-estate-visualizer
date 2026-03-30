@@ -1,15 +1,14 @@
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
-from PIL import Image, ImageOps, ImageFilter
-import io, torch, numpy as np
+from PIL import Image, ImageFilter
+import io, json, base64, asyncio, torch
 
 from pipeline import get_inpaint_pipe
 from segment import router as segment_router
 
 app = FastAPI(title="Real‑Estate Image Customizer API", version="0.1.0")
 
-# Permissive CORS for local dev; lock down in production
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -18,11 +17,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(segment_router) 
+app.include_router(segment_router)
+
 
 @app.get("/api/health")
 def health():
     return {"ok": True}
+
 
 def preprocess_mask(mask_l: Image.Image, dilate_px: int = 8, blur_px: int = 6) -> Image.Image:
     m = mask_l.convert("L")
@@ -33,199 +34,203 @@ def preprocess_mask(mask_l: Image.Image, dilate_px: int = 8, blur_px: int = 6) -
         m = m.filter(ImageFilter.GaussianBlur(radius=blur_px))
     return m
 
-def enhance_prompt(prompt: str) -> str:
-    """
-    Boost specific keywords (colors, materials) and append quality tags.
-    """
-    p = prompt.lower()
-    
-    # 1. Boost Colors
-    colors = ["black", "white", "gray", "red", "blue", "green", "yellow", "brown", "beige", "gold", "silver"]
-    dict_colors = {c: f"({c}:1.4)" for c in colors} # 1.4 is a strong boost
-    
-    # 2. Boost Materials
-    materials = ["wood", "marble", "tile", "brick", "stone", "glass", "metal", "concrete", "fabric", "leather"]
-    dict_materials = {m: f"({m}:1.3)" for m in materials}
 
-    # Replace words in prompt
+def enhance_prompt(prompt: str) -> str:
+    p = prompt.lower()
+    colors = ["black", "white", "gray", "red", "blue", "green", "yellow", "brown", "beige", "gold", "silver"]
+    materials = ["wood", "marble", "tile", "brick", "stone", "glass", "metal", "concrete", "fabric", "leather"]
+    boosts = {c: f"({c}:1.4)" for c in colors}
+    boosts.update({m: f"({m}:1.3)" for m in materials})
     words = p.split()
     new_words = []
     for w in words:
-        # Strip punctuation for matching
         clean_w = w.strip(",.!:;")
-        if clean_w in dict_colors:
-            new_w = w.replace(clean_w, dict_colors[clean_w])
-            new_words.append(new_w)
-        elif clean_w in dict_materials:
-            new_w = w.replace(clean_w, dict_materials[clean_w])
-            new_words.append(new_w)
-        else:
-            new_words.append(w)
-            
-    enhanced_base = " ".join(new_words)
-    
-    # 3. Append Quality Suffix
+        new_words.append(w.replace(clean_w, boosts[clean_w]) if clean_w in boosts else w)
     quality_suffix = ", highly detailed, professional interior design photography, 8k, realistic lighting, sharp focus, magazine quality"
-    
-    return enhanced_base + quality_suffix
+    return " ".join(new_words) + quality_suffix
+
 
 def get_mask_bbox(mask: Image.Image) -> tuple[int, int, int, int]:
-    """Get the bounding box of the mask non-zero regions."""
     bbox = mask.getbbox()
-    if bbox is None:
-        return (0, 0, mask.width, mask.height)
-    return bbox
+    return bbox if bbox is not None else (0, 0, mask.width, mask.height)
+
 
 def pad_bbox(bbox: tuple[int, int, int, int], width: int, height: int, padding: int = 32) -> tuple[int, int, int, int]:
-    """Expand bbox by padding, keeping within image bounds."""
     min_x, min_y, max_x, max_y = bbox
-    min_x = max(0, min_x - padding)
-    min_y = max(0, min_y - padding)
-    max_x = min(width, max_x + padding)
-    max_y = min(height, max_y + padding)
-    return (min_x, min_y, max_x, max_y)
+    return (
+        max(0, min_x - padding),
+        max(0, min_y - padding),
+        min(width, max_x + padding),
+        min(height, max_y + padding),
+    )
+
+
+def mask_coverage(mask: Image.Image) -> float:
+    """Return fraction of non-zero pixels in the mask (0.0 – 1.0)."""
+    import numpy as np
+    arr = np.array(mask.convert("L"))
+    return float((arr > 128).sum()) / max(arr.size, 1)
+
+
+def adaptive_steps(base_steps: int, coverage: float, strength: float) -> int:
+    """
+    Reduce inference steps based on mask size and edit strength.
+    High-strength ops (removal) need more steps than regular edits at the same
+    mask size since they generate from near-noise, but still benefit from reduction
+    on small masks.
+    """
+    if strength >= 0.9:
+        # Removal / heavy fills: gentler reduction — needs enough steps to converge from noise
+        if coverage < 0.05:
+            return max(18, round(base_steps * 0.57))   # < 5%  → ~20 steps at default 35
+        if coverage < 0.15:
+            return max(22, round(base_steps * 0.74))   # < 15% → ~26 steps at default 35
+        return base_steps
+    else:
+        # Regular edits: aggressive reduction is safe since model starts closer to the answer
+        if coverage < 0.05:
+            return max(10, round(base_steps * 0.40))   # < 5%  → ~14 steps
+        if coverage < 0.15:
+            return max(12, round(base_steps * 0.55))   # < 15% → ~19 steps
+        return base_steps
+
 
 @app.post("/api/edit")
 async def edit_image(
-    image: UploadFile = File(..., description="Original image (jpg/png)"),
-    prompt: str = Form(..., description="What to change/add"),
-    mask: UploadFile | None = File(None, description="White=edit, black=keep (png)"),
-    negative_prompt: str = Form("blurry, low quality, watermark, text, distorted",
-                                description="What to avoid"),
+    image: UploadFile = File(...),
+    prompt: str = Form(...),
+    mask: UploadFile | None = File(None),
+    negative_prompt: str = Form("blurry, low quality, watermark, text, distorted"),
     guidance_scale: float = Form(7.5),
     num_inference_steps: int = Form(35),
-    strength: float = Form(0.65, description="How strong the edit is (0-1)"),
+    strength: float = Form(0.65),
     seed: int | None = Form(None),
     width: int | None = Form(None),
     height: int | None = Form(None),
 ):
-    # Read original
+    # --- Read inputs ---
     img_bytes = await image.read()
     try:
         init_image = Image.open(io.BytesIO(img_bytes)).convert("RGB")
     except Exception as e:
         return JSONResponse({"error": f"Invalid image: {e}"}, status_code=400)
 
-    # Optional resizing
     if width and height:
         init_image = init_image.resize((int(width), int(height)), Image.LANCZOS)
 
-    # Read mask (expects white where we want to edit)
     if mask is not None:
         mask_bytes = await mask.read()
         try:
             mask_image = Image.open(io.BytesIO(mask_bytes)).convert("L")
         except Exception as e:
             return JSONResponse({"error": f"Invalid mask: {e}"}, status_code=400)
-        # Ensure same size
         if mask_image.size != init_image.size:
             mask_image = mask_image.resize(init_image.size, Image.NEAREST)
     else:
-        # If no mask provided, assume full‑frame edit (all white)
         mask_image = Image.new("L", init_image.size, color=255)
 
-    # Step 7: Post-process mask (dilate + feather) for better blending
     mask_image = preprocess_mask(mask_image, dilate_px=8, blur_px=6)
 
-    # --- Crop-to-Mask Logic ---
-    # 1. Calculate bounding box of the mask
+    # --- Adaptive steps based on mask coverage ---
+    coverage = mask_coverage(mask_image)
+    effective_step_count = adaptive_steps(int(num_inference_steps), coverage, float(strength))
+    print(f"[INFO] Mask coverage: {coverage:.1%}, strength: {strength} → using {effective_step_count} steps", flush=True)
+
+    # --- Crop to mask bounding box ---
     bbox = get_mask_bbox(mask_image)
-    # 2. Pad the bbox to give context
     padded_bbox = pad_bbox(bbox, init_image.width, init_image.height, padding=64)
-    # 3. Crop image and mask
     crop_image = init_image.crop(padded_bbox)
     crop_mask = mask_image.crop(padded_bbox)
-    
-    # --- DEBUG START: Save intermediates ---
-    try:
-        import os
-        debug_dir = "debug_output"
-        os.makedirs(debug_dir, exist_ok=True)
-        crop_image.save(os.path.join(debug_dir, "last_crop_input.png"))
-        crop_mask.save(os.path.join(debug_dir, "last_mask_input.png"))
-        print(f"[DEBUG] Saved crop/mask to {os.path.abspath(debug_dir)}", flush=True)
-    except Exception as e:
-        print(f"[DEBUG] Failed to save intermediates: {e}", flush=True)
-    # --- DEBUG END ---
-    
-    # 4. Resize for detail (optional, but requested)
-    # Resize long side to 1024 for high detail in the crop
-    target_size = 1024
+
+    # --- Resize crop to 512 (SD 1.5 native resolution, 4× faster than 1024) ---
+    TARGET_SIZE = 512
     w, h = crop_image.size
-    scale = 1.0
-    if max(w, h) < target_size:
-        # Only upscale if smaller, or usually we might want to scale *to* 1024 regardless?
-        # Let's scale to exactly target_size on long edge for consistency
-        scale = target_size / max(w, h)
-        new_w = int(w * scale)
-        new_h = int(h * scale)
-        # Ensure divisible by 8 for VAE
-        new_w = new_w - (new_w % 8)
-        new_h = new_h - (new_h % 8)
-        
+    if max(w, h) > TARGET_SIZE or max(w, h) < TARGET_SIZE:
+        scale = TARGET_SIZE / max(w, h)
+        new_w = max(8, int(w * scale) - (int(w * scale) % 8))
+        new_h = max(8, int(h * scale) - (int(h * scale) % 8))
         proc_image = crop_image.resize((new_w, new_h), Image.LANCZOS)
         proc_mask = crop_mask.resize((new_w, new_h), Image.NEAREST)
     else:
-        # Ensure divisible by 8 even if not resizing
         new_w = w - (w % 8)
         new_h = h - (h % 8)
         proc_image = crop_image.crop((0, 0, new_w, new_h))
         proc_mask = crop_mask.crop((0, 0, new_w, new_h))
 
+    # --- Pipeline setup ---
     pipe = get_inpaint_pipe()
-    
     generator = None
     if seed is not None:
-        device = pipe.device
-        generator = torch.Generator(device=device).manual_seed(int(seed))
+        generator = torch.Generator(device=pipe.device).manual_seed(int(seed))
 
-    # Run the inpainting pipeline on the CROP
-    
-    # Enhance prompt before sending to basic pipe
     first_prompt = enhance_prompt(prompt)
-    print(f"Original Prompt: {prompt}", flush=True)
-    print(f"Enhanced Prompt: {first_prompt}", flush=True)
-    
-    result_crop = pipe(
-        prompt=first_prompt,
-        image=proc_image,
-        mask_image=proc_mask,
-        negative_prompt=negative_prompt,
-        guidance_scale=float(guidance_scale),
-        num_inference_steps=int(num_inference_steps),
-        generator=generator,
-        strength=float(strength),
-    ).images[0]
+    print(f"[INFO] Prompt: {first_prompt}", flush=True)
 
-    # --- DEBUG START ---
-    try:
-        import os
-        result_crop.save(os.path.join("debug_output", "last_result_crop.png"))
-        print(f"[DEBUG] Saved result crop", flush=True)
-    except Exception as e:
-        print(f"[DEBUG] Failed to save result crop: {e}", flush=True)
-    # --- DEBUG END ---
+    # Effective steps the scheduler will actually run (strength truncates the schedule)
+    reported_total = max(1, round(effective_step_count * float(strength)))
 
-    # 5. Paste back
+    # --- SSE streaming via queue + step callback ---
+    queue: asyncio.Queue = asyncio.Queue()
+    loop = asyncio.get_running_loop()
 
-    # Resize result back to original crop size
-    # Note: If we trimmed the original crop to be div-by-8, we might have lost a few pixels.
-    # But usually we want to resize back to the *padded_bbox* size.
-    # Let's check the size diff.
-    orig_crop_w = padded_bbox[2] - padded_bbox[0]
-    orig_crop_h = padded_bbox[3] - padded_bbox[1]
-    
-    result_crop_resized = result_crop.resize((orig_crop_w, orig_crop_h), Image.LANCZOS)
-    
-    # Paste into full image using the blurred mask as alpha to blend
-    # This prevents seams at the square crop boundaries
-    final_image = init_image.copy()
-    final_image.paste(result_crop_resized, padded_bbox, mask=crop_mask)
-    
-    result = final_image
+    def step_callback(_pipe, step_index: int, _timestep, callback_kwargs: dict):
+        loop.call_soon_threadsafe(
+            queue.put_nowait,
+            {"type": "progress", "step": step_index + 1, "total": reported_total},
+        )
+        return callback_kwargs
 
-    # Stream PNG back
-    out_buf = io.BytesIO()
-    result.save(out_buf, format="PNG")
-    out_buf.seek(0)
-    return StreamingResponse(out_buf, media_type="image/png")
+    async def run_pipe():
+        try:
+            result = await loop.run_in_executor(
+                None,
+                lambda: pipe(
+                    prompt=first_prompt,
+                    image=proc_image,
+                    mask_image=proc_mask,
+                    negative_prompt=negative_prompt,
+                    guidance_scale=float(guidance_scale),
+                    num_inference_steps=effective_step_count,
+                    generator=generator,
+                    strength=float(strength),
+                    callback_on_step_end=step_callback,
+                ),
+            )
+            await queue.put({"type": "done", "image": result.images[0]})
+        except Exception as e:
+            await queue.put({"type": "error", "message": str(e)})
+
+    async def event_stream():
+        asyncio.create_task(run_pipe())
+        try:
+            while True:
+                event = await queue.get()
+
+                if event["type"] == "progress":
+                    yield f"data: {json.dumps({'step': event['step'], 'total': event['total']})}\n\n"
+
+                elif event["type"] == "done":
+                    result_crop = event["image"]
+                    orig_w = padded_bbox[2] - padded_bbox[0]
+                    orig_h = padded_bbox[3] - padded_bbox[1]
+                    result_crop_resized = result_crop.resize((orig_w, orig_h), Image.LANCZOS)
+                    final_image = init_image.copy()
+                    final_image.paste(result_crop_resized, padded_bbox, mask=crop_mask)
+
+                    buf = io.BytesIO()
+                    final_image.save(buf, format="PNG")
+                    b64 = base64.b64encode(buf.getvalue()).decode()
+                    yield f"data: {json.dumps({'done': True, 'image': b64})}\n\n"
+                    break
+
+                elif event["type"] == "error":
+                    yield f"data: {json.dumps({'error': event['message']})}\n\n"
+                    break
+        except asyncio.CancelledError:
+            pass
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
