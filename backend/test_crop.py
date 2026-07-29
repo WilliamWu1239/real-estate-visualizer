@@ -1,6 +1,8 @@
 import requests
 from PIL import Image, ImageDraw
+import base64
 import io
+import json
 import time
 
 def create_test_data():
@@ -41,11 +43,24 @@ def test_edit():
     print("Sending request...")
     for i in range(12): # Retry for 60s
         try:
-            response = requests.post(url, files=files, data=data)
+            response = requests.post(url, files=files, data=data, stream=True)
             if response.status_code == 200:
-                with open('test_result.png', 'wb') as f:
-                    f.write(response.content)
-                print("Success! Saved test_result.png")
+                # Backend streams SSE: progress events, then the final image
+                for line in response.iter_lines(decode_unicode=True):
+                    if not line or not line.startswith("data: "):
+                        continue
+                    event = json.loads(line[len("data: "):])
+                    if "error" in event:
+                        print(f"Error: {event['error']}")
+                        return
+                    if event.get("done") and event.get("image"):
+                        with open('test_result.png', 'wb') as f:
+                            f.write(base64.b64decode(event["image"]))
+                        print("Success! Saved test_result.png")
+                        return
+                    if "step" in event:
+                        print(f"  step {event['step']}/{event['total']}")
+                print("Error: stream ended without a result")
                 return
             else:
                 print(f"Error: {response.status_code} - {response.text}")

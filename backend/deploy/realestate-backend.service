@@ -1,0 +1,26 @@
+# Template systemd unit for the FastAPI backend.
+#
+# Copy to /etc/systemd/system/realestate-backend.service on the VM, then:
+#   - adjust User=, WorkingDirectory=, ExecStart= if your username or clone
+#     path differ from the ubuntu/home/ubuntu defaults below (check `whoami`, `pwd`)
+#   - replace the ALLOWED_ORIGINS value with your real Vercel URL
+#
+# Binds to 127.0.0.1:8000 (not 0.0.0.0) because Caddy sits in front of it and
+# terminates TLS on 443 -- the backend should not be reachable directly from
+# the internet on an unencrypted port once Caddy is in place.
+
+[Unit]
+Description=Real Estate Visualizer FastAPI backend
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/real-estate-visualizer/backend
+Environment=ALLOWED_ORIGINS=https://your-app.vercel.app
+ExecStart=/home/ubuntu/real-estate-visualizer/.venv/bin/uvicorn app:app --host 127.0.0.1 --port 8000
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

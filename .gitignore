@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Backend runtime/dead files
+backend/debug_output/
+backend/test_result.png
+
+# Env files
+.env
+.env.local
+*.env.local
+
+# OS
+.DS_Store
+Thumbs.db

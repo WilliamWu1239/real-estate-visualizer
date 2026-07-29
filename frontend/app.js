@@ -522,8 +522,33 @@ async function generate() {
       const err = await resp.json().catch(() => ({}));
       throw new Error(err.error || `HTTP ${resp.status}`);
     }
-    const blob = await resp.blob();
-    const url = URL.createObjectURL(blob);
+
+    // The backend streams Server-Sent Events: progress lines, then the result
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let resultB64 = null;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() ?? '';
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        const data = JSON.parse(line.slice(6));
+        if (data.error) throw new Error(data.error);
+        if (data.done && data.image) {
+          resultB64 = data.image;
+        } else if (data.step !== undefined) {
+          statusDiv.textContent = `Generating... step ${data.step}/${data.total}`;
+        }
+      }
+    }
+
+    if (!resultB64) throw new Error('Stream ended without a result');
+    const url = 'data:image/png;base64,' + resultB64;
     resultImg.src = url;
     statusDiv.textContent = 'Done.';
     downloadBtn.onclick = () => {

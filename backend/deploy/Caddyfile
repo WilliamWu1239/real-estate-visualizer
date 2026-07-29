@@ -1,0 +1,21 @@
+# Template Caddyfile for the reverse proxy in front of the FastAPI backend.
+#
+# Copy to /etc/caddy/Caddyfile on the VM (replacing the placeholder domain
+# below with your real DuckDNS subdomain), then `sudo systemctl reload caddy`.
+# Caddy automatically issues and renews a Let's Encrypt certificate for the
+# domain named in the site block -- no manual certbot steps needed, as long
+# as ports 80/443 are open in both the cloud firewall (OCI Security List)
+# and the VM's OS-level firewall (iptables).
+#
+# read_timeout is raised well above defaults because CPU-only inference on
+# this VM (no GPU) can take anywhere from tens of seconds to a few minutes,
+# and the /api/edit endpoint streams progress over SSE for the duration --
+# a short proxy timeout would kill the connection before the result arrives.
+
+your-subdomain.duckdns.org {
+    reverse_proxy 127.0.0.1:8000 {
+        transport http {
+            read_timeout 300s
+        }
+    }
+}

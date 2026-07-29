@@ -1,6 +1,8 @@
 import { useState, useCallback } from 'react';
 import type { Segment } from '../types';
 
+const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+
 function imageFromBase64(b64: string): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
     const img = new Image();
@@ -26,7 +28,7 @@ export function useSegmentation() {
   const fetchSegments = useCallback(async (imageBlob: Blob, sensitivity: number): Promise<string> => {
     const fd = new FormData();
     fd.append('image', imageBlob, 'image.png');
-    const url = new URL('http://localhost:8000/api/segment');
+    const url = new URL(`${API_URL}/api/segment`);
     url.searchParams.append('threshold', String(sensitivity));
 
     const resp = await fetch(url.toString(), { method: 'POST', body: fd });

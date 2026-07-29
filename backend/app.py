@@ -2,17 +2,23 @@ from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from PIL import Image, ImageFilter
-import io, json, base64, asyncio, torch
+import io, json, base64, asyncio, os, torch
 
 from pipeline import get_inpaint_pipe
 from segment import router as segment_router
 
-app = FastAPI(title="Real‑Estate Image Customizer API", version="0.1.0")
+app = FastAPI(title="Real-Estate Image Customizer API", version="0.1.0")
+
+ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.environ.get("ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",")
+    if origin.strip()
+]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -36,18 +42,14 @@ def preprocess_mask(mask_l: Image.Image, dilate_px: int = 8, blur_px: int = 6) -
 
 
 def enhance_prompt(prompt: str) -> str:
-    p = prompt.lower()
-    colors = ["black", "white", "gray", "red", "blue", "green", "yellow", "brown", "beige", "gold", "silver"]
-    materials = ["wood", "marble", "tile", "brick", "stone", "glass", "metal", "concrete", "fabric", "leather"]
-    boosts = {c: f"({c}:1.4)" for c in colors}
-    boosts.update({m: f"({m}:1.3)" for m in materials})
-    words = p.split()
-    new_words = []
-    for w in words:
-        clean_w = w.strip(",.!:;")
-        new_words.append(w.replace(clean_w, boosts[clean_w]) if clean_w in boosts else w)
-    quality_suffix = ", highly detailed, professional interior design photography, 8k, realistic lighting, sharp focus, magazine quality"
-    return " ".join(new_words) + quality_suffix
+    # Diffusers does not parse (word:1.4) attention-weight syntax — those
+    # parentheses would be fed to CLIP as literal tokens and degrade output.
+    # Keep the suffix short: CLIP truncates prompts at 77 tokens.
+    p = prompt.strip().rstrip(",.")
+    quality_terms = ("photorealistic", "realistic lighting", "high detail", "8k", "4k")
+    if any(term in p.lower() for term in quality_terms):
+        return p
+    return p + ", photorealistic interior photo, realistic lighting, high detail"
 
 
 def get_mask_bbox(mask: Image.Image) -> tuple[int, int, int, int]:
@@ -55,14 +57,39 @@ def get_mask_bbox(mask: Image.Image) -> tuple[int, int, int, int]:
     return bbox if bbox is not None else (0, 0, mask.width, mask.height)
 
 
-def pad_bbox(bbox: tuple[int, int, int, int], width: int, height: int, padding: int = 32) -> tuple[int, int, int, int]:
+def _expand_axis(lo: int, hi: int, limit: int, min_size: int) -> tuple[int, int]:
+    """Grow [lo, hi] to at least min_size, keeping it centered and within [0, limit]."""
+    lo, hi = max(0, lo), min(limit, hi)
+    extra = min_size - (hi - lo)
+    if extra <= 0:
+        return lo, hi
+    lo -= extra // 2
+    hi += extra - extra // 2
+    if lo < 0:
+        hi -= lo
+        lo = 0
+    if hi > limit:
+        lo = max(0, lo - (hi - limit))
+        hi = limit
+    return lo, hi
+
+
+def pad_bbox(
+    bbox: tuple[int, int, int, int],
+    width: int,
+    height: int,
+    padding: int = 32,
+    min_size: int = 512,
+) -> tuple[int, int, int, int]:
+    """
+    Pad the mask bbox, then expand the crop to at least min_size per axis.
+    Small masks get surrounding room context (better blending) and are
+    processed at the model's native 512px instead of being upscaled.
+    """
     min_x, min_y, max_x, max_y = bbox
-    return (
-        max(0, min_x - padding),
-        max(0, min_y - padding),
-        min(width, max_x + padding),
-        min(height, max_y + padding),
-    )
+    x0, x1 = _expand_axis(min_x - padding, max_x + padding, width, min_size)
+    y0, y1 = _expand_axis(min_y - padding, max_y + padding, height, min_size)
+    return (x0, y0, x1, y1)
 
 
 def mask_coverage(mask: Image.Image) -> float:
@@ -82,17 +109,21 @@ def adaptive_steps(base_steps: int, coverage: float, strength: float) -> int:
     if strength >= 0.9:
         # Removal / heavy fills: gentler reduction — needs enough steps to converge from noise
         if coverage < 0.05:
-            return max(18, round(base_steps * 0.57))   # < 5%  → ~20 steps at default 35
-        if coverage < 0.15:
-            return max(22, round(base_steps * 0.74))   # < 15% → ~26 steps at default 35
-        return base_steps
+            steps = max(18, round(base_steps * 0.57))
+        elif coverage < 0.15:
+            steps = max(22, round(base_steps * 0.74))
+        else:
+            steps = base_steps
     else:
         # Regular edits: aggressive reduction is safe since model starts closer to the answer
         if coverage < 0.05:
-            return max(10, round(base_steps * 0.40))   # < 5%  → ~14 steps
-        if coverage < 0.15:
-            return max(12, round(base_steps * 0.55))   # < 15% → ~19 steps
-        return base_steps
+            steps = max(10, round(base_steps * 0.40))
+        elif coverage < 0.15:
+            steps = max(12, round(base_steps * 0.55))
+        else:
+            steps = base_steps
+    # The floors above must never raise the count past what the user asked for
+    return min(steps, base_steps)
 
 
 @app.post("/api/edit")
@@ -102,7 +133,7 @@ async def edit_image(
     mask: UploadFile | None = File(None),
     negative_prompt: str = Form("blurry, low quality, watermark, text, distorted"),
     guidance_scale: float = Form(7.5),
-    num_inference_steps: int = Form(35),
+    num_inference_steps: int = Form(24),
     strength: float = Form(0.65),
     seed: int | None = Form(None),
     width: int | None = Form(None),
@@ -134,7 +165,8 @@ async def edit_image(
     # --- Adaptive steps based on mask coverage ---
     coverage = mask_coverage(mask_image)
     effective_step_count = adaptive_steps(int(num_inference_steps), coverage, float(strength))
-    print(f"[INFO] Mask coverage: {coverage:.1%}, strength: {strength} → using {effective_step_count} steps", flush=True)
+    # ASCII only: Windows consoles default to cp1252 and crash on unicode arrows
+    print(f"[INFO] Mask coverage: {coverage:.1%}, strength: {strength} -> using {effective_step_count} steps", flush=True)
 
     # --- Crop to mask bounding box ---
     bbox = get_mask_bbox(mask_image)
@@ -145,7 +177,7 @@ async def edit_image(
     # --- Resize crop to 512 (SD 1.5 native resolution, 4× faster than 1024) ---
     TARGET_SIZE = 512
     w, h = crop_image.size
-    if max(w, h) > TARGET_SIZE or max(w, h) < TARGET_SIZE:
+    if max(w, h) != TARGET_SIZE:
         scale = TARGET_SIZE / max(w, h)
         new_w = max(8, int(w * scale) - (int(w * scale) % 8))
         new_h = max(8, int(h * scale) - (int(h * scale) % 8))
@@ -166,8 +198,9 @@ async def edit_image(
     first_prompt = enhance_prompt(prompt)
     print(f"[INFO] Prompt: {first_prompt}", flush=True)
 
-    # Effective steps the scheduler will actually run (strength truncates the schedule)
-    reported_total = max(1, round(effective_step_count * float(strength)))
+    # Effective steps the scheduler will actually run (strength truncates the
+    # schedule; diffusers uses int(), not round())
+    reported_total = max(1, int(effective_step_count * float(strength)))
 
     # --- SSE streaming via queue + step callback ---
     queue: asyncio.Queue = asyncio.Queue()

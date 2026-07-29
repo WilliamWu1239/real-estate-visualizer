@@ -9,7 +9,7 @@ import type { GenerationParams, GenerationProgress } from './types';
 const DEFAULT_PARAMS: GenerationParams = {
   prompt: '',
   negativePrompt: 'blurry, low quality, distorted, watermark, text',
-  steps: 35,
+  steps: 24,
   guidance: 7.5,
   strength: 0.65,
   seed: '',
@@ -17,6 +17,8 @@ const DEFAULT_PARAMS: GenerationParams = {
 
 const REMOVAL_PROMPT =
   'photorealistic interior, seamless background fill, match surrounding floor walls and surfaces, no objects, clean empty space';
+
+const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
 function base64ToObjectUrl(b64: string): string {
   const binary = atob(b64);
@@ -41,7 +43,7 @@ async function callGenerateApi(
   fd.append('strength', String(params.strength));
   if (params.seed) fd.append('seed', String(params.seed));
 
-  const resp = await fetch('http://localhost:8000/api/edit', { method: 'POST', body: fd });
+  const resp = await fetch(`${API_URL}/api/edit`, { method: 'POST', body: fd });
   if (!resp.ok) {
     const err = await resp.json().catch(() => ({}));
     throw new Error((err as { error?: string }).error || `HTTP ${resp.status}`);
