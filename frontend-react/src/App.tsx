@@ -43,7 +43,24 @@ async function callGenerateApi(
   fd.append('strength', String(params.strength));
   if (params.seed) fd.append('seed', String(params.seed));
 
-  const resp = await fetch(`${API_URL}/api/edit`, { method: 'POST', body: fd });
+  // Modal's web endpoints enforce a hard 150s HTTP request timeout; abort a
+  // little before that so we can show a friendly retry message instead of a
+  // raw network error on the rare request that runs long.
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 160_000);
+
+  let resp: Response;
+  try {
+    resp = await fetch(`${API_URL}/api/edit`, { method: 'POST', body: fd, signal: controller.signal });
+  } catch (e) {
+    if ((e as Error).name === 'AbortError') {
+      throw new Error('Generation is taking longer than expected — please try again.');
+    }
+    throw e;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+
   if (!resp.ok) {
     const err = await resp.json().catch(() => ({}));
     throw new Error((err as { error?: string }).error || `HTTP ${resp.status}`);
@@ -99,7 +116,7 @@ export default function App() {
       return;
     }
     const mergedParams = { ...params, ...overrideParams };
-    setStatus(statusMsg + ' (first run may download the model)');
+    setStatus(statusMsg + ' (waking up the model may take up to ~30s)');
     setProgress(null);
     setResultUrl('');
     setBeforeUrl(canvasHook.getImageDataUrl());
